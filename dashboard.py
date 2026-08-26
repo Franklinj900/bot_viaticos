@@ -7,7 +7,7 @@ from slack_sdk.errors import SlackApiError
 
 st.set_page_config(page_title="Dashboard Viáticos", page_icon="💰", layout="wide")
 
-SLACK_TOKEN = "xoxb-8347621043874-11876070517300-UmSznvLrwxbYswaa2ZT40Prb"
+os.getenv("SLACK_BOT_TOKEN")
 
 if "autenticado" not in st.session_state: st.session_state.autenticado = False
 if "codigo_secreto" not in st.session_state: st.session_state.codigo_secreto = None
