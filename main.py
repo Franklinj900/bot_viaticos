@@ -11,8 +11,12 @@ contexto_ssl = ssl.create_default_context()
 contexto_ssl.check_hostname = False
 contexto_ssl.verify_mode = ssl.CERT_NONE
 
-cliente_slack = AsyncWebClient(token="xoxb-8347621043874-11876070517300-UmSznvLrwxbYswaa2ZT40Prb", ssl=contexto_ssl)
-slack_app = AsyncApp(client=cliente_slack, signing_secret="ed8ce9508fdbd757f56806b9853a4454")
+# Extraemos los secretos de la caja fuerte de Render
+SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+cliente_slack = AsyncWebClient(token=SLACK_TOKEN, ssl=contexto_ssl)
+slack_app = AsyncApp(client=cliente_slack, signing_secret=SIGNING_SECRET)
 
 ESTADOS_VENEZUELA = ["Amazonas", "Anzoátegui", "Apure", "Aragua", "Barinas", "Bolívar", "Carabobo", "Cojedes", "Delta Amacuro", "Falcón", "Guárico", "Lara", "Mérida", "Miranda", "Monagas", "Nueva Esparta", "Portuguesa", "Sucre", "Táchira", "Trujillo", "La Guaira", "Yaracuy", "Zulia", "Distrito Capital"]
 TIPOS_EQUIPO = [{"text": {"type": "plain_text", "text": t}, "value": t} for t in ["Ecógrafo", "Rayos X", "Tomógrafo", "Incubadora", "Resonador", "Monitor", "Anestesia", "Otro"]]
