@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+slack_bolt
+slack_sdk
+sqlalchemy
+aiohttp
+streamlit
+pandas
+psycopg2-binary
