@@ -8,7 +8,14 @@ URL_BASE_DATOS = os.getenv("DATABASE_URL")
 if not URL_BASE_DATOS:
     raise ValueError("⚠️ ERROR CRÍTICO: No se encontró la variable DATABASE_URL.")
 
-engine = create_engine(URL_BASE_DATOS)
+# --- AQUÍ ESTÁ EL CAMBIO ---
+# Agregamos los escudos preventivos directamente al motor de la base de datos
+engine = create_engine(
+    URL_BASE_DATOS,
+    pool_pre_ping=True,  # Verifica que Neon no esté dormido antes de consultar
+    pool_recycle=300     # Recicla la conexión cada 5 minutos de forma invisible
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
