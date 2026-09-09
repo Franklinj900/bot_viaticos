@@ -19,11 +19,8 @@ except Exception as e:
     cliente_slack = None
 
 # --- 2. GESTIÓN DE COOKIES (MANTENER SESIÓN ABIERTA) ---
-@st.cache_resource
-def obtener_gestor_cookies():
-    return stx.CookieManager()
-
-gestor_cookies = obtener_gestor_cookies()
+# Inicializamos el gestor directamente para evitar el CachedWidgetWarning
+gestor_cookies = stx.CookieManager(key="gestor_cookies_app")
 
 # Intentar leer la cookie al cargar la página
 usuario_guardado = gestor_cookies.get(cookie="usuario_viaticos")
