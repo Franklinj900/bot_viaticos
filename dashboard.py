@@ -1,188 +1,219 @@
-import os
-import random
-import pandas as pd
 import streamlit as st
-from database import engine
+import pandas as pd
+import datetime
+import random
+import extra_streamlit_components as stx
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from database import SessionLocal
 
-st.set_page_config(page_title="Dashboard Viáticos", page_icon="💰", layout="wide")
+# --- 1. CONFIGURACIÓN INICIAL ---
+st.set_page_config(page_title="Dashboard Viáticos", page_icon="📊", layout="wide")
 
-# Cargar el Token de Slack desde las variables de entorno (Sin claves expuestas)
-SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+# Inicializar el cliente de Slack usando los Secretos de Streamlit
+try:
+    SLACK_TOKEN = st.secrets["SLACK_BOT_TOKEN"]
+    cliente_slack = WebClient(token=SLACK_TOKEN)
+except Exception as e:
+    st.error("⚠️ Error: No se encontró el SLACK_BOT_TOKEN en los Secrets de Streamlit.")
+    cliente_slack = None
 
-# Control de Sesión
-if "autenticado" not in st.session_state: 
-    st.session_state.autenticado = False
-if "codigo_secreto" not in st.session_state: 
-    st.session_state.codigo_secreto = None
+# --- 2. GESTIÓN DE COOKIES (MANTENER SESIÓN ABIERTA) ---
+@st.cache_resource
+def obtener_gestor_cookies():
+    return stx.CookieManager()
 
-def enviar_codigo_slack(email):
-    if not SLACK_TOKEN:
-        st.error("❌ No se encontró la variable de entorno SLACK_BOT_TOKEN.")
-        return False
-    
-    client = WebClient(token=SLACK_TOKEN)
+gestor_cookies = obtener_gestor_cookies()
+
+# Intentar leer la cookie al cargar la página
+usuario_guardado = gestor_cookies.get(cookie="usuario_viaticos")
+
+# Inicializar el estado de la sesión
+if "autenticado" not in st.session_state:
+    st.session_state["autenticado"] = False
+if "esperando_codigo" not in st.session_state:
+    st.session_state["esperando_codigo"] = False
+
+# Si la cookie existe, forzar autenticación silenciosa
+if usuario_guardado:
+    st.session_state["autenticado"] = True
+    st.session_state["usuario"] = usuario_guardado
+
+
+# --- 3. FUNCIONES DE BASE DE DATOS Y SLACK ---
+def cargar_datos_viaticos():
+    """Descarga los datos de Neon.tech con protección anti-bloqueos."""
+    db = SessionLocal()
     try:
-        user_info = client.users_lookupByEmail(email=email)
-        slack_user_id = user_info["user"]["id"]
-        codigo = str(random.randint(1000, 9999))
-        st.session_state.codigo_secreto = codigo
-        client.chat_postMessage(channel=slack_user_id, text=f"🔐 Tu código de acceso: *{codigo}*")
-        return True
-    except SlackApiError:
-        st.error("❌ No se encontró tu correo en el espacio de trabajo de Slack.")
-        return False
+        query = """
+        SELECT 
+            v.fecha_gasto, 
+            s.fecha_servicio AS "Fecha_Ticket", 
+            v.id_servicio AS "Ticket_Num", 
+            s.cliente AS "Cliente", 
+            s.estado_ve AS "Estado", 
+            s.ciudad AS "Ciudad", 
+            v.categoria_gasto AS "Categoria", 
+            v.monto_usd_calculado AS "Total_USD", 
+            v.tasa_bcv_dia AS "Tasa_BCV" 
+        FROM viaticos v 
+        LEFT JOIN servicios s ON v.id_servicio = s.id_servicio
+        ORDER BY v.fecha_gasto DESC
+        """
+        df = pd.read_sql(query, db.bind)
+        # Asegurarnos de que las fechas sean formato datetime en Pandas
+        if not df.empty:
+            df["fecha_gasto"] = pd.to_datetime(df["fecha_gasto"])
+        return df
+    except Exception as e:
+        db.rollback() # <- EL ESCUDO CONTRA EL ERROR "Invalid Transaction"
+        st.error(f"Error al conectar con la base de datos: {e}")
+        return pd.DataFrame()
+    finally:
+        db.close()
 
-# --- PANTALLA DE LOGIN ---
-if not st.session_state.autenticado:
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.title("🔐 Acceso Seguro")
-        email = st.text_input("Correo electrónico corporativo")
-        if st.button("Enviar código por Slack"):
-            if email and enviar_codigo_slack(email): 
-                st.success("✅ ¡Código enviado a tu Slack!")
+def enviar_codigo_slack(correo):
+    """Busca al usuario por correo en Slack y le envía un DM con un código de 4 dígitos."""
+    try:
+        # Buscar el ID del usuario en Slack usando su correo
+        respuesta_usuario = cliente_slack.users_lookupByEmail(email=correo)
+        user_id = respuesta_usuario["user"]["id"]
         
-        if st.session_state.codigo_secreto:
-            codigo_ingresado = st.text_input("Ingresa el código enviado", type="password")
-            if st.button("Entrar al Dashboard"):
-                if codigo_ingresado == st.session_state.codigo_secreto:
-                    st.session_state.autenticado = True
+        # Generar código aleatorio de 4 dígitos
+        codigo_generado = str(random.randint(1000, 9999))
+        
+        # Enviar mensaje directo
+        mensaje = f"🔐 Tu código de acceso al Dashboard de Viáticos es: *{codigo_generado}*\n_No compartas este código con nadie._"
+        cliente_slack.chat_postMessage(channel=user_id, text=mensaje)
+        
+        return codigo_generado
+    except SlackApiError as e:
+        st.error("No se pudo encontrar un usuario de Slack con ese correo o el bot no tiene permisos.")
+        return None
+
+
+# --- 4. INTERFAZ DE LOGIN ---
+if not st.session_state["autenticado"]:
+    st.title("🔐 Acceso Seguro - Dashboard de Viáticos")
+    st.markdown("Por favor, verifica tu identidad usando tu correo corporativo conectado a Slack.")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        # Paso 1: Pedir el correo
+        if not st.session_state["esperando_codigo"]:
+            correo_input = st.text_input("Correo Electrónico (Slack)")
+            if st.button("Enviar código de verificación", type="primary"):
+                if correo_input and cliente_slack:
+                    with st.spinner("Buscando en Slack y enviando código..."):
+                        codigo = enviar_codigo_slack(correo_input.strip())
+                        if codigo:
+                            st.session_state["codigo_real"] = codigo
+                            st.session_state["email_temporal"] = correo_input.strip()
+                            st.session_state["esperando_codigo"] = True
+                            st.rerun()
+                else:
+                    st.warning("Ingresa un correo válido.")
+                    
+        # Paso 2: Pedir el código
+        else:
+            st.info(f"Se ha enviado un código por mensaje directo de Slack a: **{st.session_state['email_temporal']}**")
+            codigo_input = st.text_input("Ingresa el código de 4 dígitos", max_chars=4)
+            
+            if st.button("Verificar y Entrar", type="primary"):
+                if codigo_input == st.session_state["codigo_real"]:
+                    # Login exitoso
+                    st.session_state["autenticado"] = True
+                    st.session_state["usuario"] = st.session_state["email_temporal"]
+                    
+                    # Crear cookie para que dure 7 días
+                    vencimiento = datetime.datetime.now() + datetime.timedelta(days=7)
+                    gestor_cookies.set("usuario_viaticos", st.session_state["usuario"], expires_at=vencimiento)
+                    
+                    st.success("¡Acceso concedido!")
                     st.rerun()
                 else:
-                    st.error("❌ Código incorrecto")
+                    st.error("Código incorrecto. Intenta de nuevo.")
+            
+            if st.button("Cancelar y volver"):
+                st.session_state["esperando_codigo"] = False
+                st.rerun()
 
-# --- PANTALLA PRINCIPAL (DASHBOARD) ---
+
+# --- 5. INTERFAZ DEL DASHBOARD (SOLO SI ESTÁ AUTENTICADO) ---
 else:
-    col1, col2 = st.columns([8, 1])
-    with col1: 
-        st.title("📊 Análisis Financiero de Viáticos")
-    with col2:
-        if st.button("Cerrar Sesión"):
-            st.session_state.autenticado = False
-            st.session_state.codigo_secreto = None
-            st.rerun()
-            
-    st.markdown("---")
-
-    try:
-        # 1. Extraer Viáticos + Datos del Servicio desde Neon.tech
-        # Usamos comillas dobles en las alias para mantener mayúsculas en PostgreSQL
-        query_v = """
-            SELECT v.fecha_gasto, 
-                   s.fecha_servicio AS "Fecha_Ticket", 
-                   v.id_servicio AS "Ticket_Num",
-                   s.cliente AS "Cliente", 
-                   s.estado_ve AS "Estado", 
-                   s.ciudad AS "Ciudad",
-                   v.categoria_gasto AS "Categoria", 
-                   v.monto_usd_calculado AS "Total_USD", 
-                   v.tasa_bcv_dia AS "Tasa_BCV"
-            FROM viaticos v 
-            LEFT JOIN servicios s ON v.id_servicio = s.id_servicio
-        """
-        df = pd.read_sql(query_v, engine)
+    # Sidebar
+    st.sidebar.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=100)
+    st.sidebar.write(f"👤 **Usuario:**\n{st.session_state['usuario']}")
+    
+    if st.sidebar.button("Cerrar Sesión"):
+        gestor_cookies.delete("usuario_viaticos")
+        for key in ["autenticado", "usuario", "esperando_codigo", "codigo_real", "email_temporal"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
         
-        df_eq = pd.DataFrame()
-        if not df.empty:
-            # 2. Extraer Equipos mapeados
-            query_e = 'SELECT id_servicio, tipo_equipo FROM equipos_asignados'
-            df_eq = pd.read_sql(query_e, engine)
-            
-            equipos_dict = df_eq.groupby('id_servicio')['tipo_equipo'].apply(list).to_dict()
-            
-            df['Equipos_Lista'] = df['Ticket_Num'].map(equipos_dict)
-            df['Equipos_Lista'] = df['Equipos_Lista'].apply(lambda x: x if isinstance(x, list) else [])
-            df['Equipos_Str'] = df['Equipos_Lista'].apply(lambda x: ", ".join(x))
-            
-            df['Fecha_Ticket'] = pd.to_datetime(df['Fecha_Ticket']).dt.date
-            
-            df['Ticket_Display'] = "TCK-" + df['Ticket_Num'].astype(str) + " | " + df['Cliente'].astype(str) + " | " + df['Fecha_Ticket'].astype(str)
-            
-    except Exception as e:
-        st.error(f"Error al conectar con la base de datos: {e}")
-        df = pd.DataFrame()
-        df_eq = pd.DataFrame()
+    st.sidebar.divider()
+    st.sidebar.header("Filtros")
+
+    # Cargar Datos
+    df = cargar_datos_viaticos()
 
     if df.empty:
-        st.info("Aún no hay viáticos registrados en la base de datos.")
+        st.title("📊 Dashboard de Viáticos")
+        st.warning("No hay datos de viáticos registrados todavía o hubo un error de conexión.")
     else:
-        st.sidebar.header("⚙️ Panel de Filtros")
-        st.sidebar.caption("💡 Deja un filtro vacío para abarcar TODAS las opciones.")
-
-        min_date, max_date = df['Fecha_Ticket'].min(), df['Fecha_Ticket'].max()
-        fechas = st.sidebar.date_input("📅 Rango de Fechas del Ticket", [min_date, max_date], min_value=min_date, max_value=max_date)
+        # Filtros Dinámicos
+        clientes_unicos = ["Todos"] + list(df["Cliente"].dropna().unique())
+        cliente_sel = st.sidebar.selectbox("Filtrar por Cliente", clientes_unicos)
         
-        # Filtros
-        tck_unicos = df['Ticket_Display'].unique().tolist()
-        f_tck = st.sidebar.multiselect("🎟️ Ticket Específico", tck_unicos)
+        categorias_unicas = ["Todas"] + list(df["Categoria"].dropna().unique())
+        categoria_sel = st.sidebar.selectbox("Filtrar por Categoría", categorias_unicas)
 
-        cli_unicos = df['Cliente'].unique().tolist()
-        f_cli = st.sidebar.multiselect("🏥 Cliente", cli_unicos)
+        # Aplicar Filtros
+        df_filtrado = df.copy()
+        if cliente_sel != "Todos":
+            df_filtrado = df_filtrado[df_filtrado["Cliente"] == cliente_sel]
+        if categoria_sel != "Todas":
+            df_filtrado = df_filtrado[df_filtrado["Categoria"] == categoria_sel]
 
-        est_unicos = df['Estado'].unique().tolist()
-        f_est = st.sidebar.multiselect("📍 Estado", est_unicos)
+        # Interfaz Principal
+        st.title("📊 Dashboard de Viáticos")
+        st.markdown("---")
+
+        # Tarjetas de KPI
+        total_usd = df_filtrado["Total_USD"].sum()
+        conteo_tickets = df_filtrado["Ticket_Num"].nunique()
+        gasto_promedio = df_filtrado["Total_USD"].mean() if not df_filtrado.empty else 0
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Gasto Total (USD)", f"${total_usd:,.2f}")
+        col2.metric("Tickets Atendidos", f"{conteo_tickets}")
+        col3.metric("Gasto Promedio por Registro", f"${gasto_promedio:,.2f}")
         
-        cat_unicas = df['Categoria'].unique().tolist()
-        f_cat = st.sidebar.multiselect("🏷️ Categoría de Gasto", cat_unicas)
+        st.markdown("---")
         
-        eq_unicos = df_eq['tipo_equipo'].unique().tolist() if not df_eq.empty else []
-        f_eq = st.sidebar.multiselect("🩺 Equipo Médico (Contiene)", eq_unicos)
-
-        # Aplicación Inteligente de Filtros
-        df_f = df.copy()
-        if len(fechas) == 2:
-            df_f = df_f[(df_f['Fecha_Ticket'] >= fechas[0]) & (df_f['Fecha_Ticket'] <= fechas[1])]
-        if f_tck: df_f = df_f[df_f['Ticket_Display'].isin(f_tck)]
-        if f_cli: df_f = df_f[df_f['Cliente'].isin(f_cli)]
-        if f_est: df_f = df_f[df_f['Estado'].isin(f_est)]
-        if f_cat: df_f = df_f[df_f['Categoria'].isin(f_cat)]
-        if f_eq: 
-            df_f = df_f[df_f['Equipos_Lista'].apply(lambda eq_list: any(e in f_eq for e in eq_list))]
-
-        # --- KPIs ---
-        total_usd = df_f['Total_USD'].sum()
-        total_tickets = df_f['Ticket_Num'].nunique()
+        # Gráficas y Tablas
+        col_grafica, col_tabla = st.columns([1, 1])
         
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Gasto Total Acumulado (USD)", f"${total_usd:,.2f}")
-        kpi2.metric("Mantenimientos Atendidos (Tickets)", total_tickets)
-        kpi3.metric("Costo Promedio por Mantenimiento", f"${(total_usd/total_tickets):,.2f}" if total_tickets > 0 else "$0.00")
+        with col_grafica:
+            st.subheader("Gastos por Categoría (USD)")
+            if not df_filtrado.empty:
+                gastos_por_cat = df_filtrado.groupby("Categoria")["Total_USD"].sum().reset_index()
+                st.bar_chart(gastos_por_cat, x="Categoria", y="Total_USD", use_container_width=True)
+            else:
+                st.info("No hay datos para graficar con los filtros actuales.")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # --- GRÁFICA LINEAL ---
-        st.subheader("📈 Tendencia de Gastos en el Tiempo (USD)")
-        if not df_f.empty:
-            gasto_tiempo = df_f.groupby('Fecha_Ticket')['Total_USD'].sum()
-            st.line_chart(gasto_tiempo)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # --- GRÁFICOS INFERIORES ---
-        graf1, graf2 = st.columns(2)
-        with graf1:
-            st.subheader("💵 Gastos por Categoría")
-            if not df_f.empty:
-                st.bar_chart(df_f.groupby('Categoria')['Total_USD'].sum())
-
-        with graf2:
-            st.subheader("🛠️ Porcentaje de Intervención por Equipo")
-            if not df_f.empty and not df_eq.empty:
-                tickets_validos = df_f['Ticket_Num'].unique()
-                equipos_filtrados = df_eq[df_eq['id_servicio'].isin(tickets_validos)]
-                
-                conteo_equipos = equipos_filtrados['tipo_equipo'].value_counts()
-                if not conteo_equipos.empty:
-                    st.bar_chart(conteo_equipos)
-                    
-                    df_porcentajes = conteo_equipos.reset_index()
-                    df_porcentajes.columns = ['Equipo', 'Cantidad de Mantenimientos']
-                    total_intervenciones = df_porcentajes['Cantidad de Mantenimientos'].sum()
-                    df_porcentajes['Porcentaje (%)'] = (df_porcentajes['Cantidad de Mantenimientos'] / total_intervenciones * 100).apply(lambda x: f"{x:.1f}%")
-                    st.dataframe(df_porcentajes, hide_index=True, use_container_width=True)
+        with col_tabla:
+            st.subheader("Gastos por Cliente (USD)")
+            if not df_filtrado.empty:
+                gastos_por_cliente = df_filtrado.groupby("Cliente")["Total_USD"].sum().sort_values(ascending=False)
+                st.dataframe(gastos_por_cliente, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("📋 Auditoría de Viáticos (Datos Crudos)")
-        st.dataframe(df_f[['Ticket_Display', 'Ciudad', 'Equipos_Str', 'Categoria', 'Total_USD']], hide_index=True, use_container_width=True)
+        st.subheader("📋 Detalle General de Viáticos")
+        # Mostrar la tabla formateada para que los números se vean limpios
+        st.dataframe(
+            df_filtrado.style.format({"Total_USD": "${:.2f}", "Tasa_BCV": "Bs. {:.2f}"}),
+            use_container_width=True, 
+            hide_index=True
+        )
