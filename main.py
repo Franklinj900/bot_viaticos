@@ -213,7 +213,17 @@ async def procesar_viaticos(ack, body, client, view):
 
 app_fastapi = FastAPI()
 slack_handler = AsyncSlackRequestHandler(slack_app)
+
 @app_fastapi.on_event("startup")
 async def startup_event(): init_db()
+
 @app_fastapi.post("/slack/events")
 async def slack_events(req: Request): return await slack_handler.handle(req)
+
+# --- ARRANCAR EL SERVIDOR PARA RENDER (ESTO ERA LO QUE FALTABA) ---
+if __name__ == "__main__":
+    import uvicorn
+    # Render asigna un puerto dinámico, si no lo encuentra usa el 8000
+    puerto = int(os.getenv("PORT", 8000))
+    # Encender el servidor FastAPI
+    uvicorn.run(app_fastapi, host="0.0.0.0", port=puerto)
