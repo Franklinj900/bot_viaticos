@@ -39,7 +39,7 @@ if usuario_guardado:
 
 # --- 3. FUNCIONES DE BASE DE DATOS Y SLACK ---
 def cargar_datos_viaticos():
-    """Descarga los datos de Neon.tech con protección anti-bloqueos."""
+    """Descarga los datos de Neon.tech con los equipos incluidos y protección anti-bloqueos."""
     db = SessionLocal()
     try:
         query = """
@@ -52,13 +52,13 @@ def cargar_datos_viaticos():
             s.ciudad AS "Ciudad", 
             v.categoria_gasto AS "Categoria", 
             v.monto_usd_calculado AS "Total_USD", 
+            (SELECT STRING_AGG(tipo_equipo, ', ') FROM equipos_asignados WHERE id_servicio = s.id_servicio) AS "Equipos",
             v.tasa_bcv_dia AS "Tasa_BCV" 
         FROM viaticos v 
         LEFT JOIN servicios s ON v.id_servicio = s.id_servicio
         ORDER BY v.fecha_gasto DESC
         """
         df = pd.read_sql(query, db.bind)
-        # Asegurarnos de que las fechas sean formato datetime en Pandas
         if not df.empty:
             df["fecha_gasto"] = pd.to_datetime(df["fecha_gasto"])
         return df
@@ -72,14 +72,11 @@ def cargar_datos_viaticos():
 def enviar_codigo_slack(correo):
     """Busca al usuario por correo en Slack y le envía un DM con un código de 4 dígitos."""
     try:
-        # Buscar el ID del usuario en Slack usando su correo
         respuesta_usuario = cliente_slack.users_lookupByEmail(email=correo)
         user_id = respuesta_usuario["user"]["id"]
         
-        # Generar código aleatorio de 4 dígitos
         codigo_generado = str(random.randint(1000, 9999))
         
-        # Enviar mensaje directo
         mensaje = f"🔐 Tu código de acceso al Dashboard de Viáticos es: *{codigo_generado}*\n_No compartas este código con nadie._"
         cliente_slack.chat_postMessage(channel=user_id, text=mensaje)
         
@@ -96,7 +93,6 @@ if not st.session_state["autenticado"]:
     
     col1, col2 = st.columns([1, 2])
     with col1:
-        # Paso 1: Pedir el correo
         if not st.session_state["esperando_codigo"]:
             correo_input = st.text_input("Correo Electrónico (Slack)")
             if st.button("Enviar código de verificación", type="primary"):
@@ -111,18 +107,15 @@ if not st.session_state["autenticado"]:
                 else:
                     st.warning("Ingresa un correo válido.")
                     
-        # Paso 2: Pedir el código
         else:
             st.info(f"Se ha enviado un código por mensaje directo de Slack a: **{st.session_state['email_temporal']}**")
             codigo_input = st.text_input("Ingresa el código de 4 dígitos", max_chars=4)
             
             if st.button("Verificar y Entrar", type="primary"):
                 if codigo_input == st.session_state["codigo_real"]:
-                    # Login exitoso
                     st.session_state["autenticado"] = True
                     st.session_state["usuario"] = st.session_state["email_temporal"]
                     
-                    # Crear cookie para que dure 7 días
                     vencimiento = datetime.datetime.now() + datetime.timedelta(days=7)
                     gestor_cookies.set("usuario_viaticos", st.session_state["usuario"], expires_at=vencimiento)
                     
@@ -150,65 +143,79 @@ else:
         st.rerun()
         
     st.sidebar.divider()
-    st.sidebar.header("Filtros")
+    st.sidebar.header("🎯 Filtros Avanzados")
 
-    # Cargar Datos
     df = cargar_datos_viaticos()
 
     if df.empty:
         st.title("📊 Dashboard de Viáticos")
-        st.warning("No hay datos de viáticos registrados todavía o hubo un error de conexión.")
+        st.warning("No hay datos de viáticos registrados todavía.")
     else:
-        # Filtros Dinámicos
-        clientes_unicos = ["Todos"] + list(df["Cliente"].dropna().unique())
-        cliente_sel = st.sidebar.selectbox("Filtrar por Cliente", clientes_unicos)
+        # Filtros Dinámicos Múltiples (Si dejas vacío, muestra todo)
+        clientes_unicos = sorted(df["Cliente"].dropna().unique())
+        cliente_sel = st.sidebar.multiselect("🏢 Clientes (Deja vacío para todos)", clientes_unicos)
         
-        categorias_unicas = ["Todas"] + list(df["Categoria"].dropna().unique())
-        categoria_sel = st.sidebar.selectbox("Filtrar por Categoría", categorias_unicas)
+        categorias_unicas = sorted(df["Categoria"].dropna().unique())
+        categoria_sel = st.sidebar.multiselect("🏷️ Categoría de Gasto", categorias_unicas)
 
-        # Aplicar Filtros
+        equipos_unicos = ["Ecógrafo", "Rayos X", "Tomógrafo", "Incubadora", "Resonador", "Monitor", "Anestesia", "Otro"]
+        equipo_sel = st.sidebar.multiselect("⚙️ Tipo de Equipo", equipos_unicos)
+
+        estados_unicos = sorted(df["Estado"].dropna().unique())
+        estado_sel = st.sidebar.multiselect("📍 Estado", estados_unicos)
+
+        # Aplicar Filtros Dinámicamente (El Motor)
         df_filtrado = df.copy()
-        if cliente_sel != "Todos":
-            df_filtrado = df_filtrado[df_filtrado["Cliente"] == cliente_sel]
-        if categoria_sel != "Todas":
-            df_filtrado = df_filtrado[df_filtrado["Categoria"] == categoria_sel]
+        
+        if cliente_sel:
+            df_filtrado = df_filtrado[df_filtrado["Cliente"].isin(cliente_sel)]
+        
+        if categoria_sel:
+            df_filtrado = df_filtrado[df_filtrado["Categoria"].isin(categoria_sel)]
+            
+        if estado_sel:
+            df_filtrado = df_filtrado[df_filtrado["Estado"].isin(estado_sel)]
+            
+        if equipo_sel:
+            # Busca si el equipo seleccionado está dentro del texto de la columna Equipos
+            patron_busqueda = '|'.join(equipo_sel)
+            df_filtrado = df_filtrado[df_filtrado["Equipos"].str.contains(patron_busqueda, na=False, regex=True)]
 
         # Interfaz Principal
         st.title("📊 Dashboard de Viáticos")
         st.markdown("---")
 
-        # Tarjetas de KPI
+        # Tarjetas de KPI (Reaccionan a los filtros al instante)
         total_usd = df_filtrado["Total_USD"].sum()
         conteo_tickets = df_filtrado["Ticket_Num"].nunique()
-        gasto_promedio = df_filtrado["Total_USD"].mean() if not df_filtrado.empty else 0
-
+        
         col1, col2, col3 = st.columns(3)
-        col1.metric("Gasto Total (USD)", f"${total_usd:,.2f}")
+        col1.metric("Gasto Total Filtrado (USD)", f"${total_usd:,.2f}")
         col2.metric("Tickets Atendidos", f"{conteo_tickets}")
-        col3.metric("Gasto Promedio por Registro", f"${gasto_promedio:,.2f}")
+        col3.metric("Gastos Registrados", f"{len(df_filtrado)}")
         
         st.markdown("---")
         
-        # Gráficas y Tablas
         col_grafica, col_tabla = st.columns([1, 1])
         
         with col_grafica:
-            st.subheader("Gastos por Categoría (USD)")
+            st.subheader("Gastos por Categoría")
             if not df_filtrado.empty:
                 gastos_por_cat = df_filtrado.groupby("Categoria")["Total_USD"].sum().reset_index()
-                st.bar_chart(gastos_por_cat, x="Categoria", y="Total_USD", use_container_width=True)
+                st.bar_chart(gastos_por_cat, x="Categoria", y="Total_USD")
             else:
-                st.info("No hay datos para graficar con los filtros actuales.")
+                st.info("Sin datos para graficar.")
 
         with col_tabla:
-            st.subheader("Gastos por Cliente (USD)")
+            st.subheader("Gastos por Cliente")
             if not df_filtrado.empty:
                 gastos_por_cliente = df_filtrado.groupby("Cliente")["Total_USD"].sum().sort_values(ascending=False)
                 st.dataframe(gastos_por_cliente, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("📋 Detalle General de Viáticos")
-        # Mostrar la tabla formateada para que los números se vean limpios
+        st.subheader("📋 Detalle Cruzado")
+        
+        # Ocultar ID interno y mostrar tabla limpia
         st.dataframe(
             df_filtrado.style.format({"Total_USD": "${:.2f}", "Tasa_BCV": "Bs. {:.2f}"}),
             use_container_width=True, 
