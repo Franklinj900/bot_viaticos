@@ -8,3 +8,4 @@ streamlit
 pandas
 psycopg2-binary
 extra-streamlit-components
+plotly
